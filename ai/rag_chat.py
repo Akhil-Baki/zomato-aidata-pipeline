@@ -11,7 +11,7 @@ from google.genai import types
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 load_dotenv()
@@ -19,52 +19,68 @@ load_dotenv()
 EMBEDDING_MODEL = "gemini-embedding-001"
 CHAT_MODEL = "gemini-3.8-flash"
 
-# Start with 100 for Streamlit Cloud.
-# Once everything works, you can increase this to 500.
 NEW_REVIEWS = 100
-
 TOP_K = 5
+
+EMBEDDING_DIMENSION = 768
 
 CACHE_FILE = "review_embeddings.parquet"
 
-EMBEDDING_DIMENSION = 768
+
+# ============================================================
+# SECRETS
+# ============================================================
+
+def get_secret(name):
+    try:
+        value = st.secrets.get(name)
+        if value:
+            return value
+    except Exception:
+        pass
+
+    return os.getenv(name)
+
+
+GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    st.error("GEMINI_API_KEY is missing.")
+    st.stop()
 
 
 # ============================================================
 # GEMINI CLIENT
 # ============================================================
 
-try:
-    GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
-except Exception:
-    GEMINI_API_KEY = None
-
-if not GEMINI_API_KEY:
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-if not GEMINI_API_KEY:
-    st.error(
-        "GEMINI_API_KEY is not configured. "
-        "Add it to Streamlit Cloud Secrets or your .env file."
-    )
-    st.stop()
-
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = genai.Client(
+    api_key=GEMINI_API_KEY
+)
 
 
 # ============================================================
-# SNOWFLAKE
+# SNOWFLAKE CONNECTION
+# ============================================================
+
+def get_snowflake_connection():
+
+    return snowflake.connector.connect(
+        account=get_secret("SNOWFLAKE_ACCOUNT"),
+        user=get_secret("SNOWFLAKE_USER"),
+        password=get_secret("SNOWFLAKE_PASSWORD"),
+        warehouse=get_secret("SNOWFLAKE_WAREHOUSE"),
+        database=get_secret("SNOWFLAKE_DATABASE"),
+        schema=get_secret("SNOWFLAKE_SCHEMA"),
+    )
+
+
+# ============================================================
+# READ REVIEWS FROM SNOWFLAKE
 # ============================================================
 
 def read_reviews_from_snowflake():
-    conn = snowflake.connector.connect(
-        account=os.getenv("SNOWFLAKE_ACCOUNT"),
-        user=os.getenv("SNOWFLAKE_USER"),
-        password=os.getenv("SNOWFLAKE_PASSWORD"),
-        warehouse=os.getenv("SNOWFLAKE_WAREHOUSE"),
-        database=os.getenv("SNOWFLAKE_DATABASE"),
-        schema=os.getenv("SNOWFLAKE_SCHEMA"),
-    )
+
+    conn = get_snowflake_connection()
 
     query = f"""
         SELECT
@@ -77,17 +93,31 @@ def read_reviews_from_snowflake():
     """
 
     try:
-        df = conn.cursor().execute(query).fetch_pandas_all()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(query)
+            df = cursor.fetch_pandas_all()
+        finally:
+            cursor.close()
+
     finally:
         conn.close()
 
-    df.columns = [col.lower() for col in df.columns]
+    df.columns = [
+        col.lower()
+        for col in df.columns
+    ]
 
-    # Remove null comments because embeddings need text
-    df["comment"] = df["comment"].fillna("").astype(str)
+    df["comment"] = (
+        df["comment"]
+        .fillna("")
+        .astype(str)
+    )
 
-    # Remove completely empty reviews
-    df = df[df["comment"].str.strip() != ""].reset_index(drop=True)
+    df = df[
+        df["comment"].str.strip() != ""
+    ].reset_index(drop=True)
 
     return df
 
@@ -97,69 +127,89 @@ def read_reviews_from_snowflake():
 # ============================================================
 
 def embed(texts):
-    """
-    Generate embeddings for multiple texts in ONE API request.
-
-    This is much better than making one API request per review.
-    """
 
     if not texts:
         return []
 
-    response = client.models.embed_content(
-        model=EMBEDDING_MODEL,
-        contents=texts,
-        config=types.EmbedContentConfig(
-            output_dimensionality=EMBEDDING_DIMENSION
-        ),
-    )
+    try:
 
-    return [
-        embedding.values
-        for embedding in response.embeddings
-    ]
+        response = client.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=texts,
+            config=types.EmbedContentConfig(
+                output_dimensionality=EMBEDDING_DIMENSION
+            ),
+        )
+
+        embeddings = [
+            embedding.values
+            for embedding in response.embeddings
+        ]
+
+        return embeddings
+
+    except Exception as e:
+
+        st.error("Gemini embedding request failed.")
+
+        st.write("Error type:", type(e).__name__)
+
+        st.code(str(e))
+
+        st.stop()
 
 
 # ============================================================
-# LOAD REVIEWS + CREATE EMBEDDINGS
+# LOAD REVIEWS AND EMBEDDINGS
 # ============================================================
 
-@st.cache_data()
+@st.cache_data
 def load_reviews():
 
-    # Use cached embeddings if available
     if os.path.exists(CACHE_FILE):
-        return pd.read_parquet(CACHE_FILE)
 
-    # Otherwise get reviews from Snowflake
+        try:
+
+            df = pd.read_parquet(CACHE_FILE)
+
+            # Make sure cached vectors use the current dimensions
+            if (
+                not df.empty
+                and "embedding" in df.columns
+                and len(df["embedding"].iloc[0])
+                == EMBEDDING_DIMENSION
+            ):
+                return df
+
+        except Exception:
+            pass
+
     df = read_reviews_from_snowflake()
 
     if df.empty:
-        st.error("No reviews were returned from Snowflake.")
+        st.error("No reviews found in Snowflake.")
         st.stop()
 
-    # Generate embeddings in a batch
-    df["embedding"] = embed(
-        df["comment"].tolist()
-    )
+    with st.spinner("Generating review embeddings..."):
 
-    # Save locally so we don't regenerate embeddings
-    # every time the Streamlit script reruns.
+        embeddings = embed(
+            df["comment"].tolist()
+        )
+
+    if len(embeddings) != len(df):
+
+        st.error(
+            "The number of embeddings does not "
+            "match the number of reviews."
+        )
+
+        st.stop()
+
+    df["embedding"] = embeddings
+
     df.to_parquet(CACHE_FILE)
 
     return df
-
-
-# ============================================================
-# STREAMLIT UI
-# ============================================================
-
-st.title("Chat with your Zomato Reviews")
-
-st.caption(
-    f"Searching {NEW_REVIEWS} reviews, "
-    f"answering with {CHAT_MODEL}"
-)
 
 
 # ============================================================
@@ -167,33 +217,44 @@ st.caption(
 # ============================================================
 
 def cosine_similarity(vec_a, vec_b):
-    vec_a = np.array(vec_a)
-    vec_b = np.array(vec_b)
+
+    vec_a = np.asarray(
+        vec_a,
+        dtype=float
+    )
+
+    vec_b = np.asarray(
+        vec_b,
+        dtype=float
+    )
 
     denominator = (
-        np.linalg.norm(vec_a) *
-        np.linalg.norm(vec_b)
+        np.linalg.norm(vec_a)
+        * np.linalg.norm(vec_b)
     )
 
     if denominator == 0:
         return 0.0
 
-    return np.dot(vec_a, vec_b) / denominator
+    return float(
+        np.dot(vec_a, vec_b) / denominator
+    )
 
 
 # ============================================================
-# RETRIEVE SIMILAR REVIEWS
+# RETRIEVE RELEVANT REVIEWS
 # ============================================================
 
 def find_similar_reviews(question, df):
 
-    # Convert the user's question into an embedding
+    # Convert question into an embedding
     question_vector = embed([question])[0]
 
     scores = []
 
-    # Compare question embedding against every review embedding
+    # Compare question with every stored review embedding
     for review_vector in df["embedding"]:
+
         score = cosine_similarity(
             question_vector,
             review_vector
@@ -201,16 +262,19 @@ def find_similar_reviews(question, df):
 
         scores.append(score)
 
-    df = df.copy()
+    result = df.copy()
 
-    df["score"] = scores
+    result["score"] = scores
 
-    # Return the most semantically similar reviews
-    return df.nlargest(TOP_K, "score")
+    # Retrieve top K relevant reviews
+    return result.nlargest(
+        TOP_K,
+        "score"
+    )
 
 
 # ============================================================
-# ASK GEMINI
+# GENERATE ANSWER USING GEMINI
 # ============================================================
 
 def ask_llm(question, top_reviews):
@@ -225,56 +289,123 @@ def ask_llm(question, top_reviews):
             f"Review: {row['comment']}\n\n"
         )
 
-    system_prompt = """
-You are answering questions about Zomato customer reviews.
+    prompt = f"""
+You are a Zomato customer review analytics assistant.
 
-Answer ONLY using the customer reviews provided below.
+Your job is to answer questions based ONLY on
+the customer reviews provided.
 
-Do not invent information.
+Rules:
 
-Be concise and directly answer the question.
+1. Use only the reviews provided.
+2. Do not invent facts.
+3. Keep the answer clear and concise.
+4. Identify patterns in customer feedback where possible.
+5. If the reviews do not contain enough information,
+   clearly say so.
+6. Do not claim that the retrieved reviews represent
+   all Zomato customers.
 
-If the provided reviews do not contain enough information
-to answer the question, say that the available reviews
-do not provide enough information.
-"""
-
-    user_prompt = f"""
-Question:
+USER QUESTION:
 {question}
 
-Customer Reviews:
+CUSTOMER REVIEWS:
 {context}
+
+ANSWER:
 """
 
-    response = client.models.generate_content(
-        model=CHAT_MODEL,
-        contents=f"""
-{system_prompt}
+    try:
 
-{user_prompt}
-"""
-    )
+        response = client.models.generate_content(
+            model=CHAT_MODEL,
+            contents=prompt,
+        )
 
-    return response.text
+        if not response.text:
+
+            return (
+                "Gemini returned an empty response. "
+                "Please try again."
+            )
+
+        return response.text
+
+    except Exception as e:
+
+        st.error("Gemini answer generation failed.")
+
+        st.write(
+            "**Error type:**",
+            type(e).__name__
+        )
+
+        # Show the HTTP status if available
+        status_code = getattr(
+            e,
+            "code",
+            None
+        )
+
+        if status_code is not None:
+
+            st.write(
+                "**HTTP status:**",
+                status_code
+            )
+
+        # Display the actual Gemini API error
+        st.write("**Gemini API error:**")
+
+        st.code(str(e))
+
+        st.info(
+            "If this is a 500 or 503 error, "
+            "it may be a temporary Gemini server issue. "
+            "If it is a 429 error, check your API quota."
+        )
+
+        st.stop()
 
 
 # ============================================================
-# LOAD DATA
+# STREAMLIT UI
+# ============================================================
+
+st.set_page_config(
+    page_title="Zomato Review RAG",
+    page_icon="🍽️",
+    layout="wide"
+)
+
+st.title("Chat with your Zomato Reviews")
+
+st.caption(
+    f"Searching {NEW_REVIEWS} reviews, "
+    f"answering with {CHAT_MODEL}"
+)
+
+
+# ============================================================
+# INITIALIZE REVIEWS
 # ============================================================
 
 review_df = load_reviews()
 
+st.success(
+    f"Loaded {len(review_df)} customer reviews."
+)
+
 
 # ============================================================
-# CHAT INPUT
+# USER QUESTION
 # ============================================================
 
 question = st.text_input(
     "Ask a question about your reviews:",
     placeholder=(
-        "e.g. What are the most common complaints "
-        "about delivery?"
+        "What are customers complaining "
+        "about the most?"
     ),
 )
 
@@ -285,38 +416,30 @@ question = st.text_input(
 
 if question:
 
-    with st.spinner("Searching reviews..."):
+    # STEP 1: Retrieve relevant reviews
+    with st.spinner("Finding relevant reviews..."):
 
-        # 1. Convert question → embedding
-        # 2. Compare against review embeddings
-        # 3. Retrieve top 5 reviews
         top_reviews = find_similar_reviews(
             question,
             review_df
         )
 
-    with st.spinner("Generating answer..."):
+    # STEP 2: Generate answer
+    with st.spinner("Generating AI answer..."):
 
-        # 4. Send question + retrieved reviews to Gemini
         answer = ask_llm(
             question,
             top_reviews
         )
 
-    # ========================================================
-    # ANSWER
-    # ========================================================
-
-    st.markdown("### Answer")
+    # STEP 3: Display answer
+    st.markdown("### AI Answer")
 
     st.write(answer)
 
-    # ========================================================
-    # SOURCES
-    # ========================================================
-
+    # STEP 4: Display retrieved reviews
     with st.expander(
-        "Reviews used to build this answer"
+        "Reviews used to generate this answer"
     ):
 
         st.dataframe(
@@ -325,8 +448,9 @@ if question:
                     "city",
                     "rating",
                     "comment",
-                    "score",
+                    "score"
                 ]
             ],
             hide_index=True,
+            use_container_width=True
         )
